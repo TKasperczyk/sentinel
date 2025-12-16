@@ -24,6 +24,7 @@ async function main() {
   console.log(`  Capture interval: ${config.captureInterval}ms`);
   console.log(`  Socket path: ${config.socketPath}`);
   console.log(`  VLM endpoint: ${config.vlmEndpoint}`);
+  console.log(`  VLM model: ${config.vlmModel}`);
 
   const stateMachine = createStateMachine();
   const ipc = await createIpcServer(config.socketPath);
@@ -31,8 +32,8 @@ async function main() {
   try {
     while (running) {
       try {
-        const screenshotPath = await captureScreen();
-        const analysis = await analyzeScreen(screenshotPath);
+        const imageData = await captureScreen();
+        const analysis = await analyzeScreen(imageData);
         const stateUpdate = stateMachine.updateFromAnalysis(analysis);
         ipc.broadcast(stateUpdate);
         console.log(`State: ${stateUpdate.state} (intensity: ${stateUpdate.intensity.toFixed(2)})`);
@@ -41,18 +42,22 @@ async function main() {
         // Continue running, will retry next interval
       }
 
-      // Interruptible sleep
+      // Interruptible sleep (clean up listener to avoid leaks)
+      if (abortController.signal.aborted) break;
+
       try {
         await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(resolve, config.captureInterval);
-          abortController.signal.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timeout);
-              reject(new Error("Aborted"));
-            },
-            { once: true },
-          );
+          const timeout = setTimeout(() => {
+            abortController.signal.removeEventListener("abort", onAbort);
+            resolve();
+          }, config.captureInterval);
+
+          function onAbort() {
+            clearTimeout(timeout);
+            reject(new Error("Aborted"));
+          }
+
+          abortController.signal.addEventListener("abort", onAbort, { once: true });
         });
       } catch {
         // Aborted, exit loop

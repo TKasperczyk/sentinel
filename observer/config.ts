@@ -3,7 +3,17 @@ function getSocketPath(): string {
   if (envPath) return envPath;
 
   const xdgRuntime = Deno.env.get("XDG_RUNTIME_DIR");
-  if (xdgRuntime) return `${xdgRuntime}/sentinel.sock`;
+  if (xdgRuntime) {
+    const probePath = `${xdgRuntime}/.sentinel-write-probe-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    try {
+      const file = Deno.openSync(probePath, { createNew: true, write: true });
+      file.close();
+      Deno.removeSync(probePath);
+      return `${xdgRuntime}/sentinel.sock`;
+    } catch {
+      console.warn(`XDG_RUNTIME_DIR not writable (${xdgRuntime}), falling back to /tmp/sentinel.sock`);
+    }
+  }
 
   return "/tmp/sentinel.sock";
 }
@@ -24,4 +34,5 @@ export const config = {
   captureInterval: getInterval(),
   socketPath: getSocketPath(),
   vlmEndpoint: Deno.env.get("SENTINEL_VLM_ENDPOINT") ?? "http://localhost:1234/v1",
+  vlmModel: Deno.env.get("SENTINEL_VLM_MODEL") ?? "qwen2.5-vl-7b-instruct",
 };
