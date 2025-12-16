@@ -1,0 +1,18 @@
+# Rust
+/renderer/target/
+
+# Deno
+/observer/.deno/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime
+*.sock
+*.log

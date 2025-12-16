@@ -1,0 +1,12 @@
+{
+  "name": "sentinel-observer",
+  "exports": "./main.ts",
+  "tasks": {
+    "build": "deno check main.ts",
+    "start": "deno run -A main.ts",
+    "dev": "deno run -A --watch main.ts"
+  },
+  "compilerOptions": {
+    "strict": true
+  }
+}

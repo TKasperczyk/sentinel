@@ -1,0 +1,24 @@
+[package]
+name = "sentinel-renderer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Wayland layer-shell
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+wayland-protocols-wlr = "0.3"
+
+# GPU rendering
+wgpu = "0.20"
+pollster = "0.3"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Async/IPC
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "signal", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
