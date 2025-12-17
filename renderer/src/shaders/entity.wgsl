@@ -261,8 +261,12 @@ fn sdf_blob(p_in: vec3<f32>, p: Params, t: f32) -> MapResult {
   var p0 = p_in;
 
   // Expression-driven tilt/lean.
-  p0.xz = rotate2(p0.xz, 0.10 * sin(t * (0.6 + p.speed)));
-  p0.xy = rotate2(p0.xy, p.tilt);
+  let rot_xz = rotate2(vec2<f32>(p0.x, p0.z), 0.10 * sin(t * (0.6 + p.speed)));
+  p0.x = rot_xz.x;
+  p0.z = rot_xz.y;
+  let rot_xy = rotate2(vec2<f32>(p0.x, p0.y), p.tilt);
+  p0.x = rot_xy.x;
+  p0.y = rot_xy.y;
   p0.x = p0.x + 0.10 * sin(t * 0.9) * (p.tilt / 0.18);
 
   // Sleepy droop.
