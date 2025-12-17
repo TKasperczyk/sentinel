@@ -6,8 +6,14 @@ edition = "2021"
 [dependencies]
 smithay-client-toolkit = { version = "0.19", features = ["calloop"] }
 wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-protocols-wlr = "0.3"
 calloop = "0.13"
 calloop-wayland-source = "0.3"
 log = "0.4"
 env_logger = "0.11"
+wgpu = "0.20"
+raw-window-handle = "0.6"
+bytemuck = { version = "1.16", features = ["derive"] }
+pollster = "0.3"
+anyhow = "1.0"

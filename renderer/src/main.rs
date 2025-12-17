@@ -1,11 +1,14 @@
-use std::time::Instant;
+mod gpu;
+
+use std::{ffi::c_void, ptr::NonNull, time::Instant};
 
 use calloop::{timer::TimeoutAction, EventLoop, LoopSignal};
 use calloop_wayland_source::WaylandSource;
-use log::info;
+use gpu::{GpuRenderer, Uniforms};
+use log::{error, info};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_layer, delegate_output, delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -16,12 +19,11 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    protocol::{wl_output, wl_surface},
+    Connection, Proxy, QueueHandle,
 };
 
 fn main() {
@@ -34,8 +36,6 @@ fn main() {
 
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("layer_shell not available");
-    let shm = Shm::bind(&globals, &qh).expect("wl_shm not available");
-
     let surface = compositor.create_surface(&qh);
 
     let layer_surface = layer_shell.create_layer_surface(
@@ -51,19 +51,41 @@ fn main() {
     layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer_surface.commit();
 
+    let display_ptr = NonNull::new(conn.display().id().as_ptr().cast::<c_void>())
+        .expect("Wayland display pointer was null");
+    let surface_ptr = NonNull::new(layer_surface.wl_surface().id().as_ptr().cast::<c_void>())
+        .expect("Wayland surface pointer was null");
+
+    let entity_state = std::env::var("SENTINEL_ENTITY_STATE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(5);
+    let intensity = std::env::var("SENTINEL_ENTITY_INTENSITY")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let cycle_states = std::env::var("SENTINEL_ENTITY_CYCLE")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+    let gpu = GpuRenderer::new(display_ptr, surface_ptr, 256, 256)
+        .expect("Failed to initialize wgpu renderer");
+
     let mut state = AppState {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
-        compositor_state: compositor,
-        shm,
-        layer_shell,
-        pool: None,
+        gpu: Some(gpu),
         layer_surface: Some(layer_surface),
         width: 256,
         height: 256,
         configured: false,
         start_time: Instant::now(),
         loop_signal: None,
+        entity_state,
+        intensity,
+        cycle_states,
     };
 
     let mut event_loop: EventLoop<AppState> =
@@ -99,76 +121,45 @@ fn main() {
 struct AppState {
     registry_state: RegistryState,
     output_state: OutputState,
-    compositor_state: CompositorState,
-    shm: Shm,
-    layer_shell: LayerShell,
-
-    pool: Option<SlotPool>,
+    // Drop order matters: `wgpu::Surface` inside `GpuRenderer` must be dropped before the
+    // underlying Wayland `wl_surface` owned by `LayerSurface`. Rust drops struct fields in
+    // declaration order, so keep `gpu` before `layer_surface`.
+    gpu: Option<GpuRenderer>,
     layer_surface: Option<LayerSurface>,
     width: u32,
     height: u32,
     configured: bool,
     start_time: Instant,
     loop_signal: Option<LoopSignal>,
+    entity_state: u32,
+    intensity: f32,
+    cycle_states: bool,
 }
 
 impl AppState {
     fn draw(&mut self) {
-        let Some(layer_surface) = &self.layer_surface else {
+        if self.layer_surface.is_none() {
+            return;
+        }
+
+        let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        let surface = layer_surface.wl_surface();
 
-        let width = self.width;
-        let height = self.height;
-        let stride = width as i32 * 4;
-        let size = (stride * height as i32) as usize;
-
-        // Create or resize pool
-        let pool = self.pool.get_or_insert_with(|| {
-            SlotPool::new(size, &self.shm).expect("Failed to create pool")
-        });
-
-        if pool.len() < size {
-            pool.resize(size).expect("Failed to resize pool");
-        }
-
-        let (buffer, canvas) = pool
-            .create_buffer(
-                width as i32,
-                height as i32,
-                stride,
-                wl_shm::Format::Argb8888,
-            )
-            .expect("Failed to create buffer");
-
-        // Animated dark background
         let t = self.start_time.elapsed().as_secs_f32();
+        let entity_state = if self.cycle_states {
+            ((t / 8.0).floor() as u32) % 6
+        } else {
+            self.entity_state
+        };
 
-        for y in 0..height {
-            for x in 0..width {
-                let idx = ((y * width + x) * 4) as usize;
-
-                // Normalized coordinates
-                let ux = x as f32 / width as f32;
-                let uy = y as f32 / height as f32;
-
-                // Animated dark blue gradient
-                let r = (10.0 + 5.0 * (t + ux * 3.0).sin()) as u8;
-                let g = (10.0 + 5.0 * (t * 1.3 + uy * 3.0).sin()) as u8;
-                let b = (26.0 + 10.0 * (t * 0.7).sin()) as u8;
-
-                // ARGB format
-                canvas[idx] = b;
-                canvas[idx + 1] = g;
-                canvas[idx + 2] = r;
-                canvas[idx + 3] = 255;
+        let uniforms = Uniforms::new(t, entity_state, self.intensity, self.width, self.height);
+        if let Err(e) = gpu.render(&uniforms) {
+            error!("wgpu render error: {e:?}");
+            if let Some(signal) = &self.loop_signal {
+                signal.stop();
             }
         }
-
-        surface.attach(Some(buffer.wl_buffer()), 0, 0);
-        surface.damage_buffer(0, 0, width as i32, height as i32);
-        surface.commit();
     }
 }
 
@@ -251,6 +242,8 @@ impl OutputHandler for AppState {
 
 impl LayerShellHandler for AppState {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
+        self.gpu = None;
+        self.layer_surface = None;
         if let Some(signal) = &self.loop_signal {
             signal.stop();
         }
@@ -273,15 +266,12 @@ impl LayerShellHandler for AppState {
 
         info!("Layer surface configured: {}x{}", self.width, self.height);
         self.configured = true;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.resize(self.width, self.height);
+        }
 
         // Draw initial frame
         self.draw();
-    }
-}
-
-impl ShmHandler for AppState {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
     }
 }
 
@@ -294,6 +284,5 @@ impl ProvidesRegistryState for AppState {
 
 delegate_compositor!(AppState);
 delegate_output!(AppState);
-delegate_shm!(AppState);
 delegate_layer!(AppState);
 delegate_registry!(AppState);
