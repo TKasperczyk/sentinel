@@ -1,6 +1,8 @@
 use std::{ffi::c_void, num::NonZeroU64, ptr::NonNull};
 
-use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
+use raw_window_handle::{
+    RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
+};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -124,10 +126,9 @@ impl GpuRenderer {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: Some(NonZeroU64::new(
-                            std::mem::size_of::<Uniforms>() as u64
-                        )
-                        .unwrap()),
+                        min_binding_size: Some(
+                            NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64).unwrap(),
+                        ),
                     },
                     count: None,
                 }],

@@ -1,11 +1,21 @@
 mod gpu;
+mod ipc;
 
-use std::{ffi::c_void, ptr::NonNull, time::Instant};
+use std::{
+    ffi::c_void,
+    io::Read,
+    path::PathBuf,
+    ptr::NonNull,
+    time::{Duration, Instant},
+};
 
-use calloop::{timer::TimeoutAction, EventLoop, LoopSignal};
+use calloop::{
+    generic::Generic, timer::TimeoutAction, EventLoop, Interest, LoopHandle, LoopSignal, Mode,
+    PostAction, RegistrationToken,
+};
 use calloop_wayland_source::WaylandSource;
 use gpu::{GpuRenderer, Uniforms};
-use log::{error, info};
+use log::{debug, error, info, warn};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry,
@@ -26,6 +36,97 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
+fn attach_ipc_client<'l>(
+    handle: &LoopHandle<'l, AppState>,
+    state: &mut AppState,
+    stream: std::os::unix::net::UnixStream,
+    path: PathBuf,
+) {
+    let Ok(token) = handle.insert_source(
+        Generic::new(stream, Interest::READ, Mode::Level),
+        move |readiness, stream, state| {
+            if readiness.error {
+                warn!("IPC socket reported error; disconnecting");
+                state.ipc_token = None;
+                state.ipc_path = None;
+                state.ipc_buffer.clear();
+                return Ok(PostAction::Remove);
+            }
+
+            let mut buffer = std::mem::take(&mut state.ipc_buffer);
+            let mut disconnected = false;
+            let mut tmp = [0u8; 4096];
+
+            loop {
+                match (&**stream).read(&mut tmp) {
+                    Ok(0) => {
+                        disconnected = true;
+                        break;
+                    }
+                    Ok(n) => buffer.extend_from_slice(&tmp[..n]),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) => {
+                        warn!("IPC read error: {err}");
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+
+            let messages = ipc::drain_messages(&mut buffer);
+            state.ipc_buffer = buffer;
+
+            let mut changed = false;
+            for msg in messages {
+                match msg {
+                    ipc::IpcMessage::State {
+                        state: entity_state,
+                        intensity,
+                    } => {
+                        let new_state = entity_state.as_u32();
+                        let new_intensity = intensity.clamp(0.0, 1.0);
+                        if state.entity_state != new_state {
+                            state.entity_state = new_state;
+                            changed = true;
+                        }
+                        if state.intensity.to_bits() != new_intensity.to_bits() {
+                            state.intensity = new_intensity;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            if changed && state.configured {
+                state.draw();
+            }
+
+            if disconnected {
+                if let Some(path) = state.ipc_path.as_ref() {
+                    warn!("IPC disconnected from {}", path.display());
+                } else {
+                    warn!("IPC disconnected");
+                }
+                state.ipc_token = None;
+                state.ipc_path = None;
+                state.ipc_buffer.clear();
+                return Ok(PostAction::Remove);
+            }
+
+            Ok(PostAction::Continue)
+        },
+    ) else {
+        warn!("Failed to register IPC socket source");
+        return;
+    };
+
+    state.ipc_token = Some(token);
+    state.ipc_path = Some(path.clone());
+    state.ipc_buffer.clear();
+    info!("IPC connected: {}", path.display());
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     info!("Sentinel Renderer starting");
@@ -38,13 +139,8 @@ fn main() {
     let layer_shell = LayerShell::bind(&globals, &qh).expect("layer_shell not available");
     let surface = compositor.create_surface(&qh);
 
-    let layer_surface = layer_shell.create_layer_surface(
-        &qh,
-        surface,
-        Layer::Background,
-        Some("sentinel"),
-        None,
-    );
+    let layer_surface =
+        layer_shell.create_layer_surface(&qh, surface, Layer::Background, Some("sentinel"), None);
 
     layer_surface.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
     layer_surface.set_exclusive_zone(-1);
@@ -70,6 +166,8 @@ fn main() {
         .ok()
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
+    let ipc_candidates = ipc::socket_candidates();
+
     let gpu = GpuRenderer::new(display_ptr, surface_ptr, 256, 256)
         .expect("Failed to initialize wgpu renderer");
 
@@ -86,28 +184,53 @@ fn main() {
         entity_state,
         intensity,
         cycle_states,
+        ipc_token: None,
+        ipc_buffer: Vec::new(),
+        ipc_path: None,
     };
 
     let mut event_loop: EventLoop<AppState> =
         EventLoop::try_new().expect("Failed to create event loop");
 
     state.loop_signal = Some(event_loop.get_signal());
+    let handle = event_loop.handle();
 
     // Set up a timer for animation (60fps)
-    let timer = calloop::timer::Timer::from_duration(std::time::Duration::from_millis(16));
-    event_loop
-        .handle()
+    let timer = calloop::timer::Timer::from_duration(Duration::from_millis(16));
+    handle
         .insert_source(timer, |_, _, state| {
             if state.configured {
                 state.draw();
             }
-            TimeoutAction::ToDuration(std::time::Duration::from_millis(16))
+            TimeoutAction::ToDuration(Duration::from_millis(16))
         })
         .expect("Failed to insert timer");
 
+    // IPC reconnect loop (1Hz).
+    let ipc_handle = handle.clone();
+    let ipc_candidates_clone = ipc_candidates.clone();
+    let reconnect_timer = calloop::timer::Timer::from_duration(Duration::from_secs(1));
+    handle
+        .insert_source(reconnect_timer, move |_, _, state| {
+            if state.ipc_token.is_none() {
+                if let Some((stream, path)) = ipc::try_connect(&ipc_candidates_clone) {
+                    attach_ipc_client(&ipc_handle, state, stream, path);
+                } else {
+                    debug!("IPC not available yet; will retry");
+                }
+            }
+            TimeoutAction::ToDuration(Duration::from_secs(1))
+        })
+        .expect("Failed to insert IPC reconnect timer");
+
+    // Attempt an eager connect at startup (avoid waiting for first reconnect tick).
+    if let Some((stream, path)) = ipc::try_connect(&ipc_candidates) {
+        attach_ipc_client(&handle, &mut state, stream, path);
+    }
+
     // Insert the Wayland event source
     WaylandSource::new(conn, event_queue)
-        .insert(event_loop.handle())
+        .insert(handle.clone())
         .expect("Failed to insert Wayland source");
 
     info!("Starting event loop");
@@ -134,6 +257,9 @@ struct AppState {
     entity_state: u32,
     intensity: f32,
     cycle_states: bool,
+    ipc_token: Option<RegistrationToken>,
+    ipc_buffer: Vec<u8>,
+    ipc_path: Option<PathBuf>,
 }
 
 impl AppState {
