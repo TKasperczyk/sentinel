@@ -3,6 +3,25 @@ function formatCommandError(stderr: Uint8Array): string {
   return text.length > 0 ? text : "unknown error";
 }
 
+export function pngDimensions(data: Uint8Array): { width: number; height: number } | null {
+  // PNG signature: 89 50 4E 47 0D 0A 1A 0A
+  if (data.byteLength < 24) return null;
+  const sig = [137, 80, 78, 71, 13, 10, 26, 10];
+  for (let i = 0; i < sig.length; i++) {
+    if (data[i] !== sig[i]) return null;
+  }
+
+  const type =
+    String.fromCharCode(data[12], data[13], data[14], data[15]);
+  if (type !== "IHDR") return null;
+
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const width = view.getUint32(16, false);
+  const height = view.getUint32(20, false);
+  if (width <= 0 || height <= 0) return null;
+  return { width, height };
+}
+
 async function runGrim(): Promise<Uint8Array> {
   const command = new Deno.Command("grim", {
     args: ["-t", "png", "-"],

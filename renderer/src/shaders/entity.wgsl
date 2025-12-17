@@ -1,10 +1,11 @@
 struct Uniforms {
   time: f32,
   intensity: f32,
-  entity_state: u32,
-  _pad0: u32,
+  blend_factor: f32,
+  _pad0: f32,
+  current_state: u32,
+  target_state: u32,
   resolution: vec2<f32>,
-  _pad1: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -40,6 +41,37 @@ fn rotate2(p: vec2<f32>, a: f32) -> vec2<f32> {
   let c = cos(a);
   let s = sin(a);
   return vec2<f32>(c * p.x - s * p.y, s * p.x + c * p.y);
+}
+
+fn hash12(p: vec2<f32>) -> f32 {
+  return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453123);
+}
+
+fn hash22(p: vec2<f32>) -> vec2<f32> {
+  let x = hash12(p);
+  let y = hash12(p + vec2<f32>(19.19, 73.73));
+  return vec2<f32>(x, y);
+}
+
+fn dust_layer(uv: vec2<f32>, t: f32, scale: f32, drift: vec2<f32>, density_edge: f32) -> f32 {
+  let gv = uv * scale + drift * t;
+  let cell = floor(gv);
+  let f = fract(gv);
+  let rnd = hash22(cell);
+  let exists = step(density_edge, rnd.x);
+
+  let pos = rnd;
+  let size = 0.010 + 0.022 * rnd.y;
+  let d = length(f - pos);
+  let speck = exists * (1.0 - smoothstep(0.0, size, d));
+  let twinkle = 0.65 + 0.35 * sin(t * 1.4 + rnd.x * 6.2831);
+  return speck * twinkle;
+}
+
+fn dust(uv: vec2<f32>, t: f32) -> f32 {
+  let d0 = dust_layer(uv, t, 82.0, vec2<f32>(0.020, -0.012), 0.985);
+  let d1 = dust_layer(uv, t, 150.0, vec2<f32>(-0.016, 0.018), 0.992);
+  return d0 * 0.65 + d1 * 0.35;
 }
 
 fn warp(p: vec3<f32>, t: f32, wobble: f32) -> vec3<f32> {
@@ -82,7 +114,7 @@ fn lerp_v3(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
   return a + (b - a) * t;
 }
 
-fn params_for(state: u32, intensity: f32) -> Params {
+fn params_for_state(state: u32, intensity: f32) -> Params {
   let k = saturate(intensity);
 
   // Idle (baseline).
@@ -240,8 +272,13 @@ fn sdf_blob(p_in: vec3<f32>, p: Params, t: f32) -> MapResult {
     p0.y = mix(p0.y, p0.y * 0.85, p.droop);
   }
 
-  let breath = 0.04 * sin(t * (0.55 + 0.35 * p.speed));
-  let pulse = 0.5 + 0.5 * sin(t * p.pulse_rate);
+  let breath_t = t * (0.50 + 0.25 * p.speed);
+  let breath = 0.036 * (0.65 * sin(breath_t) + 0.35 * sin(breath_t * 2.0 + 1.3));
+
+  let pulse_t = t * p.pulse_rate;
+  let pulse_warp = sin(pulse_t + 0.35 * sin(pulse_t * 0.5 + 1.7));
+  let pulse = smoothstep(-1.0, 1.0, pulse_warp);
+
   let radius = p.base_radius + breath + p.pulse_amp * (pulse - 0.5);
 
   var q = warp(p0, t, p.deform);
@@ -323,14 +360,8 @@ fn ambient_occlusion(pos: vec3<f32>, nor: vec3<f32>, p: Params, t: f32) -> f32 {
   return saturate(1.0 - occ);
 }
 
-@fragment
-fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
-  let res = u.resolution;
-  let px = frag_coord.xy;
+fn render_state(px: vec2<f32>, res: vec2<f32>, t: f32, p: Params) -> vec3<f32> {
   let uv = px / res;
-
-  let t = u.time;
-  let p = params_for(u.entity_state, u.intensity);
 
   // Background: deep blue/purple gradient with subtle pulse (tied to state).
   let v = uv.y;
@@ -338,6 +369,10 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   var bg = vec3<f32>(0.03, 0.04, 0.08) + vec3<f32>(0.02, 0.02, 0.05) * (1.0 - v);
   bg = bg + vec3<f32>(0.05, 0.02, 0.08) * bg_pulse;
   bg = mix(bg, bg + vec3<f32>(0.10, 0.02, 0.01), p.warn * 0.35);
+
+  let dust_v = dust(uv, t);
+  let dust_col = mix(vec3<f32>(0.12, 0.14, 0.20), p.accent_col, 0.25);
+  bg = bg + dust_col * dust_v * (0.05 + 0.03 * p.glow);
 
   // Normalized screen coordinates (preserve aspect).
   let p2 = (2.0 * px - res) / res.y;
@@ -357,7 +392,8 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   for (var i: i32 = 0; i < 72; i = i + 1) {
     let pos = ro + rd * dist;
     mr = sdf_blob(pos, p, t);
-    glow_acc = glow_acc + 0.03 * p.glow * exp(-abs(mr.d) * 6.0);
+    let glow_w = exp(-abs(mr.d) * (8.5 + 7.0 * p.warn));
+    glow_acc = glow_acc + 0.025 * (0.35 + 0.65 * p.glow) * glow_w * (0.25 + 0.75 * mr.glow);
     if (mr.d < 0.0015) {
       hit = true;
       break;
@@ -372,8 +408,8 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     // Subtle vignette.
     let d2 = length(p2);
     let vignette = 1.0 - 0.35 * saturate(d2 * d2);
-    let out_bg = bg * vignette + vec3<f32>(0.06, 0.03, 0.09) * glow_acc * 0.35;
-    return vec4<f32>(out_bg, 1.0);
+    let haze = glow_acc * (0.12 + 0.22 * p.glow);
+    return bg * vignette + p.accent_col * haze;
   }
 
   let pos = ro + rd * dist;
@@ -396,13 +432,50 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   col = col + p.accent_col * (spec + 0.45 * rim) * (0.35 + 0.55 * p.glow);
 
   // Emissive glow (eyes/core + accumulated mist).
-  let emissive = (mr.glow * 0.9 + glow_acc * 0.7 + rim * 0.22) * (0.55 + 0.65 * p.glow);
+  let emissive = (mr.glow * 0.95 + glow_acc * 0.85 + rim * 0.26) * (0.50 + 0.75 * p.glow);
   col = col + p.accent_col * emissive;
+
+  // Outer halo and subtle chromatic fringe (rim-based aberration).
+  let halo = glow_acc * (0.12 + 0.25 * p.glow) + pow(rim, 1.35) * (0.10 + 0.18 * p.glow);
+  col = col + p.accent_col * halo;
+
+  let edge = saturate(length(p2) * 0.9);
+  let fringe = pow(rim, 1.15) * (0.010 + 0.020 * p.glow) * (0.35 + 0.65 * edge);
+  col = col + vec3<f32>(fringe, 0.0, -fringe);
 
   // Blend in background haze, keep dark theme.
   col = mix(bg, col, 0.88);
 
   // Gentle tonemapping.
+  col = max(col, vec3<f32>(0.0));
   col = col / (col + vec3<f32>(1.0));
-  return vec4<f32>(col, 1.0);
+  return col;
+}
+
+@fragment
+fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = u.resolution;
+  let px = frag_coord.xy;
+
+  let t = u.time;
+
+  let blend = saturate(u.blend_factor);
+  let cur_state = u.current_state;
+  let tgt_state = u.target_state;
+
+  let p_cur = params_for_state(cur_state, u.intensity);
+  let p_tgt = params_for_state(tgt_state, u.intensity);
+
+  if (blend <= 0.0001 || cur_state == tgt_state) {
+    let col = render_state(px, res, t, p_cur);
+    return vec4<f32>(col, 1.0);
+  }
+  if (blend >= 0.9999) {
+    let col = render_state(px, res, t, p_tgt);
+    return vec4<f32>(col, 1.0);
+  }
+
+  let col_a = render_state(px, res, t, p_cur);
+  let col_b = render_state(px, res, t, p_tgt);
+  return vec4<f32>(mix(col_a, col_b, blend), 1.0);
 }

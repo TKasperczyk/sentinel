@@ -1,5 +1,6 @@
 use std::{ffi::c_void, num::NonZeroU64, ptr::NonNull};
 
+use log::info;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
@@ -10,21 +11,31 @@ use wgpu::util::DeviceExt;
 pub struct Uniforms {
     pub time: f32,
     pub intensity: f32,
-    pub entity_state: u32,
-    _pad0: u32,
+    pub blend_factor: f32,
+    _pad0: f32,
+    pub current_state: u32,
+    pub target_state: u32,
     pub resolution: [f32; 2],
-    _pad1: [f32; 2],
 }
 
 impl Uniforms {
-    pub fn new(time: f32, entity_state: u32, intensity: f32, width: u32, height: u32) -> Self {
+    pub fn new(
+        time: f32,
+        current_state: u32,
+        target_state: u32,
+        blend_factor: f32,
+        intensity: f32,
+        width: u32,
+        height: u32,
+    ) -> Self {
         Self {
             time,
             intensity: intensity.clamp(0.0, 1.0),
-            entity_state: entity_state.min(5),
-            _pad0: 0,
+            blend_factor: blend_factor.clamp(0.0, 1.0),
+            _pad0: 0.0,
+            current_state: current_state.min(5),
+            target_state: target_state.min(5),
             resolution: [width as f32, height as f32],
-            _pad1: [0.0, 0.0],
         }
     }
 }
@@ -71,6 +82,16 @@ impl GpuRenderer {
         }))
         .ok_or_else(|| anyhow::anyhow!("No suitable GPU adapter found"))?;
 
+        let adapter_info = adapter.get_info();
+        info!(
+            "GPU adapter: {} (vendor={:#06x} device={:#06x} type={:?} backend={:?})",
+            adapter_info.name,
+            adapter_info.vendor,
+            adapter_info.device,
+            adapter_info.device_type,
+            adapter_info.backend
+        );
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
@@ -105,6 +126,10 @@ impl GpuRenderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        info!(
+            "Surface configured: {}x{} format={:?} alpha_mode={:?}",
+            config.width, config.height, format, alpha_mode
+        );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Sentinel Entity Shader"),
@@ -113,7 +138,15 @@ impl GpuRenderer {
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sentinel Uniform Buffer"),
-            contents: bytemuck::bytes_of(&Uniforms::new(0.0, 0, 0.0, config.width, config.height)),
+            contents: bytemuck::bytes_of(&Uniforms::new(
+                0.0,
+                0,
+                0,
+                0.0,
+                0.0,
+                config.width,
+                config.height,
+            )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 

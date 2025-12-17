@@ -9,14 +9,57 @@ interface VlmResponse {
 }
 
 const PROMPT =
-  `Analyze this screenshot and respond with ONLY a JSON object:\n` +
-  `{\n` +
-  `  "activity": "coding" | "browsing" | "media" | "chat" | "gaming" | "idle" | "error" | "other",\n` +
-  `  "mood": "focused" | "relaxed" | "frustrated" | "entertained" | "neutral",\n` +
-  `  "hasErrors": boolean,\n` +
-  `  "confidence": 0.0-1.0\n` +
-  `}\n\n` +
-  `Look for: code editors, terminals, browsers, video players, games, error dialogs, red warning indicators.`;
+  `
+Analyze this screenshot and respond with ONLY a JSON object (no markdown, no extra keys).
+
+Schema:
+{
+  "activity": "coding" | "browsing" | "media" | "chat" | "gaming" | "idle" | "error" | "other",
+  "mood": "focused" | "relaxed" | "frustrated" | "entertained" | "neutral",
+  "hasErrors": boolean,
+  "confidence": 0.0-1.0
+}
+
+Classification rules:
+- Pick the PRIMARY activity based on the foreground app.
+- "coding": IDE/editor (VS Code/JetBrains/vim), terminal with dev commands/logs, diffs, build output.
+- "browsing": web pages/docs/search, even if code snippets are visible.
+- "chat": messaging apps/web chat with conversation threads.
+- "media": video/audio player UI (timeline/play controls) or streaming content.
+- "gaming": game viewport/HUD/menus.
+- "idle": lock screen, wallpaper, blank desktop/no active content.
+- "error": only when the SCREEN IS DOMINATED by an error/failure screen (crash dialog, BSOD-like screen, blocking error modal, full stack trace page).
+
+Error detection (reduce false positives):
+- Set "hasErrors": true ONLY for explicit errors: visible words like "error", "failed", "exception", "traceback", "panic", or a clear crash/error dialog.
+- Do NOT treat red syntax highlighting, git diff colors, warning icons, or a single red underline as an error by itself.
+- If there is an error while still clearly coding/browsing, keep "activity" as that task and set "hasErrors": true.
+
+Mood guidance:
+- focused: coding, reading docs, work dashboards.
+- relaxed: casual browsing, music, calm desktop.
+- entertained: videos, games, memes.
+- frustrated: prominent errors/failures or crash dialogs.
+- neutral: idle/ambiguous.
+
+Few-shot examples (descriptions → JSON):
+1) "VS Code with source code, terminal shows tests passing" →
+{"activity":"coding","mood":"focused","hasErrors":false,"confidence":0.85}
+2) "Browser reading documentation with code snippets" →
+{"activity":"browsing","mood":"focused","hasErrors":false,"confidence":0.75}
+3) "Chat app with conversation thread" →
+{"activity":"chat","mood":"relaxed","hasErrors":false,"confidence":0.80}
+4) "Video player with playback controls" →
+{"activity":"media","mood":"entertained","hasErrors":false,"confidence":0.85}
+5) "Game with HUD/minimap" →
+{"activity":"gaming","mood":"entertained","hasErrors":false,"confidence":0.85}
+6) "Terminal shows compilation error output" →
+{"activity":"coding","mood":"frustrated","hasErrors":true,"confidence":0.80}
+7) "Crash dialog or full-screen error screen" →
+{"activity":"error","mood":"frustrated","hasErrors":true,"confidence":0.85}
+
+If unsure, use "activity":"other" and set confidence ≤ 0.4.
+`.trim();
 
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -41,10 +84,52 @@ function chatCompletionsUrl(endpoint: string): string {
 
 function extractJson(text: string): string | null {
   const trimmed = text.trim();
-  const start = trimmed.indexOf("{");
-  const end = trimmed.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) return null;
-  return trimmed.slice(start, end + 1);
+
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] !== "{") continue;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let j = i; j < trimmed.length; j++) {
+      const ch = trimmed[j];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (ch === "\\") {
+          escaped = true;
+          continue;
+        }
+        if (ch === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === "\"") {
+        inString = true;
+        continue;
+      }
+      if (ch === "{") depth++;
+      if (ch === "}") depth--;
+
+      if (depth === 0) {
+        const candidate = trimmed.slice(i, j + 1);
+        try {
+          JSON.parse(candidate);
+          return candidate;
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
 function normalizeActivity(value: unknown): Activity {

@@ -1,4 +1,4 @@
-import { captureScreen } from "./src/capture.ts";
+import { captureScreen, pngDimensions } from "./src/capture.ts";
 import { analyzeScreen } from "./src/vlm.ts";
 import { createStateMachine } from "./src/state.ts";
 import { createIpcServer } from "./src/ipc.ts";
@@ -28,11 +28,18 @@ async function main() {
 
   const stateMachine = createStateMachine();
   const ipc = await createIpcServer(config.socketPath);
+  let loggedCaptureResolution = false;
 
   try {
     while (running) {
       try {
         const imageData = await captureScreen();
+        if (!loggedCaptureResolution) {
+          const dims = pngDimensions(imageData);
+          if (dims) console.log(`  Capture resolution: ${dims.width}x${dims.height}`);
+          else console.log("  Capture resolution: unknown");
+          loggedCaptureResolution = true;
+        }
         const analysis = await analyzeScreen(imageData);
         const stateUpdate = stateMachine.updateFromAnalysis(analysis);
         ipc.broadcast(stateUpdate);

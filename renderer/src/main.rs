@@ -36,6 +36,108 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
+#[derive(Debug, Copy, Clone)]
+struct SmoothValue {
+    current: f32,
+    from: f32,
+    target: f32,
+    started_at: Instant,
+}
+
+impl SmoothValue {
+    fn new(value: f32, now: Instant) -> Self {
+        Self {
+            current: value,
+            from: value,
+            target: value,
+            started_at: now,
+        }
+    }
+
+    fn set_target(&mut self, target: f32, now: Instant) {
+        if self.target.to_bits() == target.to_bits() {
+            return;
+        }
+        self.from = self.current;
+        self.target = target;
+        self.started_at = now;
+    }
+
+    fn update(&mut self, now: Instant, duration: Duration) {
+        if self.current.to_bits() == self.target.to_bits() {
+            return;
+        }
+
+        let duration_s = duration.as_secs_f32();
+        if duration_s <= 0.000_1 {
+            self.current = self.target;
+            return;
+        }
+
+        let elapsed_s = now.duration_since(self.started_at).as_secs_f32();
+        let mut t = (elapsed_s / duration_s).clamp(0.0, 1.0);
+        t = t * t * (3.0 - 2.0 * t);
+        self.current = self.from + (self.target - self.from) * t;
+        if t >= 1.0 {
+            self.current = self.target;
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+struct StateBlend {
+    current_state: u32,
+    target_state: u32,
+    blend: SmoothValue,
+}
+
+impl StateBlend {
+    fn new(state: u32, now: Instant) -> Self {
+        Self {
+            current_state: state.min(5),
+            target_state: state.min(5),
+            blend: SmoothValue::new(0.0, now),
+        }
+    }
+
+    fn set_target(&mut self, target_state: u32, now: Instant) {
+        let target_state = target_state.min(5);
+        if self.target_state == target_state {
+            return;
+        }
+
+        if self.current_state != self.target_state && self.blend.current >= 0.5 {
+            self.current_state = self.target_state;
+        }
+
+        self.target_state = target_state;
+        if self.current_state == self.target_state {
+            self.blend = SmoothValue::new(0.0, now);
+            return;
+        }
+
+        self.blend = SmoothValue::new(0.0, now);
+        self.blend.set_target(1.0, now);
+    }
+
+    fn update(&mut self, now: Instant, duration: Duration) {
+        if self.current_state == self.target_state {
+            self.blend = SmoothValue::new(0.0, now);
+            return;
+        }
+
+        self.blend.update(now, duration);
+        if self.blend.current >= 1.0 {
+            self.current_state = self.target_state;
+            self.blend = SmoothValue::new(0.0, now);
+        }
+    }
+
+    fn blend_factor(&self) -> f32 {
+        self.blend.current
+    }
+}
+
 fn attach_ipc_client<'l>(
     handle: &LoopHandle<'l, AppState>,
     state: &mut AppState,
@@ -77,6 +179,7 @@ fn attach_ipc_client<'l>(
             let messages = ipc::drain_messages(&mut buffer);
             state.ipc_buffer = buffer;
 
+            let now = Instant::now();
             let mut changed = false;
             for msg in messages {
                 match msg {
@@ -86,12 +189,12 @@ fn attach_ipc_client<'l>(
                     } => {
                         let new_state = entity_state.as_u32();
                         let new_intensity = intensity.clamp(0.0, 1.0);
-                        if state.entity_state != new_state {
-                            state.entity_state = new_state;
+                        if state.entity_state.target_state != new_state {
+                            state.entity_state.set_target(new_state, now);
                             changed = true;
                         }
-                        if state.intensity.to_bits() != new_intensity.to_bits() {
-                            state.intensity = new_intensity;
+                        if state.intensity.target.to_bits() != new_intensity.to_bits() {
+                            state.intensity.set_target(new_intensity, now);
                             changed = true;
                         }
                     }
@@ -166,11 +269,19 @@ fn main() {
         .ok()
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
+    let transition_duration = std::env::var("SENTINEL_TRANSITION_DURATION")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(Duration::from_secs_f32)
+        .unwrap_or(Duration::from_millis(750));
+
     let ipc_candidates = ipc::socket_candidates();
 
     let gpu = GpuRenderer::new(display_ptr, surface_ptr, 256, 256)
         .expect("Failed to initialize wgpu renderer");
 
+    let start_time = Instant::now();
     let mut state = AppState {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -179,10 +290,11 @@ fn main() {
         width: 256,
         height: 256,
         configured: false,
-        start_time: Instant::now(),
+        start_time,
         loop_signal: None,
-        entity_state,
-        intensity,
+        transition_duration,
+        entity_state: StateBlend::new(entity_state, start_time),
+        intensity: SmoothValue::new(intensity, start_time),
         cycle_states,
         ipc_token: None,
         ipc_buffer: Vec::new(),
@@ -254,8 +366,9 @@ struct AppState {
     configured: bool,
     start_time: Instant,
     loop_signal: Option<LoopSignal>,
-    entity_state: u32,
-    intensity: f32,
+    transition_duration: Duration,
+    entity_state: StateBlend,
+    intensity: SmoothValue,
     cycle_states: bool,
     ipc_token: Option<RegistrationToken>,
     ipc_buffer: Vec<u8>,
@@ -272,14 +385,26 @@ impl AppState {
             return;
         };
 
+        let now = Instant::now();
         let t = self.start_time.elapsed().as_secs_f32();
-        let entity_state = if self.cycle_states {
-            ((t / 8.0).floor() as u32) % 6
-        } else {
-            self.entity_state
-        };
 
-        let uniforms = Uniforms::new(t, entity_state, self.intensity, self.width, self.height);
+        if self.cycle_states {
+            let cycle_state = ((t / 8.0).floor() as u32) % 6;
+            self.entity_state.set_target(cycle_state, now);
+        }
+
+        self.entity_state.update(now, self.transition_duration);
+        self.intensity.update(now, self.transition_duration);
+
+        let uniforms = Uniforms::new(
+            t,
+            self.entity_state.current_state,
+            self.entity_state.target_state,
+            self.entity_state.blend_factor(),
+            self.intensity.current,
+            self.width,
+            self.height,
+        );
         if let Err(e) = gpu.render(&uniforms) {
             error!("wgpu render error: {e:?}");
             if let Some(signal) = &self.loop_signal {
@@ -390,7 +515,7 @@ impl LayerShellHandler for AppState {
             self.height = configure.new_size.1;
         }
 
-        info!("Layer surface configured: {}x{}", self.width, self.height);
+        info!("Display resolution: {}x{}", self.width, self.height);
         self.configured = true;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.resize(self.width, self.height);
