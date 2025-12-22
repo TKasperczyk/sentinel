@@ -12,10 +12,12 @@ pub struct Uniforms {
     pub time: f32,
     pub intensity: f32,
     pub blend_factor: f32,
-    _pad0: f32,
+    pub scale: f32,
     pub current_state: u32,
     pub target_state: u32,
     pub resolution: [f32; 2],
+    pub position: [f32; 2],
+    _pad1: [f32; 2],
 }
 
 impl Uniforms {
@@ -25,17 +27,23 @@ impl Uniforms {
         target_state: u32,
         blend_factor: f32,
         intensity: f32,
+        scale: f32,
+        position: [f32; 2],
         width: u32,
         height: u32,
     ) -> Self {
+        let scale = scale.clamp(0.35, 2.5);
+        let position = [position[0].clamp(0.0, 1.0), position[1].clamp(0.0, 1.0)];
         Self {
             time,
             intensity: intensity.clamp(0.0, 1.0),
             blend_factor: blend_factor.clamp(0.0, 1.0),
-            _pad0: 0.0,
+            scale,
             current_state: current_state.min(5),
             target_state: target_state.min(5),
             resolution: [width as f32, height as f32],
+            position,
+            _pad1: [0.0; 2],
         }
     }
 }
@@ -144,6 +152,8 @@ impl GpuRenderer {
                 0,
                 0.0,
                 0.0,
+                1.0,
+                [0.5, 0.5],
                 config.width,
                 config.height,
             )),

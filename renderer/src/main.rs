@@ -138,6 +138,199 @@ impl StateBlend {
     }
 }
 
+#[derive(Debug, Copy, Clone)]
+struct MotionParams {
+    base_scale: f32,
+    scale_pulse: f32,
+    pulse_speed: f32,
+    drift_amp: [f32; 2],
+    drift_speed: f32,
+    bounce_mix: f32,
+    bounce_speed: f32,
+    base_offset: [f32; 2],
+    smooth_time: f32,
+}
+
+impl MotionParams {
+    fn for_state(state: u32, intensity: f32) -> Self {
+        let intensity = intensity.clamp(0.0, 1.0);
+        let energy = 0.35 + 0.65 * intensity;
+
+        let mut params = match state {
+            1 => Self {
+                base_scale: 1.25,
+                scale_pulse: 0.1,
+                pulse_speed: 1.1,
+                drift_amp: [0.16, 0.12],
+                drift_speed: 0.45,
+                bounce_mix: 0.6,
+                bounce_speed: 0.25,
+                base_offset: [0.0, 0.05],
+                smooth_time: 0.7,
+            },
+            2 => Self {
+                base_scale: 0.7,
+                scale_pulse: 0.02,
+                pulse_speed: 0.5,
+                drift_amp: [0.02, 0.015],
+                drift_speed: 0.12,
+                bounce_mix: 0.0,
+                bounce_speed: 0.1,
+                base_offset: [0.0, 0.0],
+                smooth_time: 0.8,
+            },
+            3 => Self {
+                base_scale: 1.05,
+                scale_pulse: 0.16,
+                pulse_speed: 1.6,
+                drift_amp: [0.12, 0.1],
+                drift_speed: 0.8,
+                bounce_mix: 0.4,
+                bounce_speed: 0.9,
+                base_offset: [0.02, 0.0],
+                smooth_time: 0.45,
+            },
+            4 => Self {
+                base_scale: 1.45,
+                scale_pulse: 0.22,
+                pulse_speed: 2.2,
+                drift_amp: [0.2, 0.18],
+                drift_speed: 1.2,
+                bounce_mix: 0.8,
+                bounce_speed: 1.1,
+                base_offset: [0.0, 0.1],
+                smooth_time: 0.35,
+            },
+            5 => Self {
+                base_scale: 0.6,
+                scale_pulse: 0.02,
+                pulse_speed: 0.35,
+                drift_amp: [0.03, 0.025],
+                drift_speed: 0.08,
+                bounce_mix: 0.0,
+                bounce_speed: 0.1,
+                base_offset: [0.0, -0.22],
+                smooth_time: 1.4,
+            },
+            _ => Self {
+                base_scale: 1.0,
+                scale_pulse: 0.04,
+                pulse_speed: 0.6,
+                drift_amp: [0.06, 0.04],
+                drift_speed: 0.2,
+                bounce_mix: 0.0,
+                bounce_speed: 0.15,
+                base_offset: [0.0, 0.0],
+                smooth_time: 1.1,
+            },
+        };
+
+        params.drift_amp[0] *= energy;
+        params.drift_amp[1] *= energy;
+        params.scale_pulse *= 0.3 + 0.7 * intensity;
+        params.drift_speed *= 0.4 + 0.6 * intensity;
+        params.bounce_speed *= 0.4 + 0.6 * intensity;
+        params.bounce_mix *= 0.2 + 0.8 * intensity;
+        params.pulse_speed *= 0.5 + 0.5 * intensity;
+
+        params
+    }
+
+    fn lerp(self, other: Self, t: f32) -> Self {
+        Self {
+            base_scale: lerp(self.base_scale, other.base_scale, t),
+            scale_pulse: lerp(self.scale_pulse, other.scale_pulse, t),
+            pulse_speed: lerp(self.pulse_speed, other.pulse_speed, t),
+            drift_amp: lerp2(self.drift_amp, other.drift_amp, t),
+            drift_speed: lerp(self.drift_speed, other.drift_speed, t),
+            bounce_mix: lerp(self.bounce_mix, other.bounce_mix, t),
+            bounce_speed: lerp(self.bounce_speed, other.bounce_speed, t),
+            base_offset: lerp2(self.base_offset, other.base_offset, t),
+            smooth_time: lerp(self.smooth_time, other.smooth_time, t),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+struct MotionState {
+    pos_x: SmoothValue,
+    pos_y: SmoothValue,
+    scale: SmoothValue,
+}
+
+impl MotionState {
+    fn new(now: Instant) -> Self {
+        Self {
+            pos_x: SmoothValue::new(0.5, now),
+            pos_y: SmoothValue::new(0.5, now),
+            scale: SmoothValue::new(1.0, now),
+        }
+    }
+
+    fn update(&mut self, now: Instant, params: MotionParams, t: f32) -> ([f32; 2], f32) {
+        let smooth_time = params.smooth_time.max(0.05);
+        let smooth = Duration::from_secs_f32(smooth_time);
+        self.pos_x.update(now, smooth);
+        self.pos_y.update(now, smooth);
+        self.scale.update(now, smooth);
+
+        let target_pos = target_position(params, t);
+        let target_scale = target_scale(params, t);
+
+        self.pos_x.set_target(target_pos[0], now);
+        self.pos_y.set_target(target_pos[1], now);
+        self.scale.set_target(target_scale, now);
+
+        ([self.pos_x.current, self.pos_y.current], self.scale.current)
+    }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn lerp2(a: [f32; 2], b: [f32; 2], t: f32) -> [f32; 2] {
+    [lerp(a[0], b[0], t), lerp(a[1], b[1], t)]
+}
+
+fn tri_wave(t: f32) -> f32 {
+    let f = t.fract();
+    if f < 0.5 {
+        f * 2.0
+    } else {
+        (1.0 - f) * 2.0
+    }
+}
+
+fn target_position(params: MotionParams, t: f32) -> [f32; 2] {
+    let base = [
+        (0.5 + params.base_offset[0]).clamp(0.05, 0.95),
+        (0.5 + params.base_offset[1]).clamp(0.05, 0.95),
+    ];
+    let drift = [
+        (t * params.drift_speed).sin() * params.drift_amp[0],
+        (t * params.drift_speed * 0.83 + 1.7).cos() * params.drift_amp[1],
+    ];
+    let bounce = [
+        lerp(0.08, 0.92, tri_wave(t * params.bounce_speed + 0.13)),
+        lerp(0.08, 0.92, tri_wave(t * params.bounce_speed * 0.93 + 0.57)),
+    ];
+
+    let mut pos = [base[0] + drift[0], base[1] + drift[1]];
+    pos[0] = lerp(pos[0], bounce[0], params.bounce_mix);
+    pos[1] = lerp(pos[1], bounce[1], params.bounce_mix);
+    pos[0] = pos[0].clamp(0.05, 0.95);
+    pos[1] = pos[1].clamp(0.05, 0.95);
+    pos
+}
+
+fn target_scale(params: MotionParams, t: f32) -> f32 {
+    let pulse = (t * params.pulse_speed).sin();
+    let wobble = (t * (params.pulse_speed * 0.4 + 0.7)).sin();
+    (params.base_scale + params.scale_pulse * pulse + params.scale_pulse * 0.35 * wobble)
+        .clamp(0.35, 2.5)
+}
+
 fn attach_ipc_client<'l>(
     handle: &LoopHandle<'l, AppState>,
     state: &mut AppState,
@@ -295,6 +488,7 @@ fn main() {
         transition_duration,
         entity_state: StateBlend::new(entity_state, start_time),
         intensity: SmoothValue::new(intensity, start_time),
+        motion: MotionState::new(start_time),
         cycle_states,
         ipc_token: None,
         ipc_buffer: Vec::new(),
@@ -369,6 +563,7 @@ struct AppState {
     transition_duration: Duration,
     entity_state: StateBlend,
     intensity: SmoothValue,
+    motion: MotionState,
     cycle_states: bool,
     ipc_token: Option<RegistrationToken>,
     ipc_buffer: Vec<u8>,
@@ -396,12 +591,20 @@ impl AppState {
         self.entity_state.update(now, self.transition_duration);
         self.intensity.update(now, self.transition_duration);
 
+        let blend = self.entity_state.blend_factor();
+        let params_cur = MotionParams::for_state(self.entity_state.current_state, self.intensity.current);
+        let params_tgt = MotionParams::for_state(self.entity_state.target_state, self.intensity.current);
+        let motion_params = params_cur.lerp(params_tgt, blend);
+        let (position, scale) = self.motion.update(now, motion_params, t);
+
         let uniforms = Uniforms::new(
             t,
             self.entity_state.current_state,
             self.entity_state.target_state,
-            self.entity_state.blend_factor(),
+            blend,
             self.intensity.current,
+            scale,
+            position,
             self.width,
             self.height,
         );

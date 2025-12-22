@@ -2,10 +2,12 @@ struct Uniforms {
   time: f32,
   intensity: f32,
   blend_factor: f32,
-  _pad0: f32,
+  scale: f32,
   current_state: u32,
   target_state: u32,
   resolution: vec2<f32>,
+  position: vec2<f32>,
+  _pad1: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -24,391 +26,211 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<
 // UTILITIES
 // ============================================================================
 
+const TAU: f32 = 6.2831853;
+const PARTICLE_COUNT: u32 = 48u;
+
 fn saturate(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
 
 fn hash21(p: vec2<f32>) -> f32 {
-  var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
-  p3 = p3 + dot(p3, vec3<f32>(p3.y + 33.33, p3.z + 33.33, p3.x + 33.33));
-  return fract((p3.x + p3.y) * p3.z);
+  let h = dot(p, vec2<f32>(127.1, 311.7));
+  return fract(sin(h) * 43758.5453123);
 }
 
-fn hash22(p: vec2<f32>) -> vec2<f32> {
-  return vec2<f32>(hash21(p), hash21(p + vec2<f32>(57.0, 113.0)));
-}
-
-// Signed distance to a line segment
-fn sd_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
-  let pa = p - a;
-  let ba = b - a;
-  let h = saturate(dot(pa, ba) / dot(ba, ba));
-  return length(pa - ba * h);
+fn value_noise(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let a = hash21(i);
+  let b = hash21(i + vec2<f32>(1.0, 0.0));
+  let c = hash21(i + vec2<f32>(0.0, 1.0));
+  let d = hash21(i + vec2<f32>(1.0, 1.0));
+  let u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
 // ============================================================================
-// FACE PARAMETERS
+// CLOUD PARAMETERS
 // ============================================================================
 
-struct FaceParams {
-  line_color: vec3<f32>,
-  node_color: vec3<f32>,
-  glow_color: vec3<f32>,
+struct CloudParams {
+  color_core: vec3<f32>,
+  color_edge: vec3<f32>,
+  color_accent: vec3<f32>,
+  swarm_radius: f32,
+  density: f32,
+  edge_softness: f32,
+  internal_motion: f32,
   pulse_speed: f32,
-  float_amount: f32,
-  particle_speed: f32,
-  eye_scale: f32,
-  eye_y_offset: f32,
-  brow_angle: f32,
-  mouth_smile: f32,
-  mouth_open: f32,
-  head_tilt: f32,
+  particle_size: f32,
+  particle_strength: f32,
 };
 
-fn params_for_state(state: u32, k: f32) -> FaceParams {
-  var p: FaceParams;
-  p.line_color = vec3<f32>(0.1, 0.6, 0.8);
-  p.node_color = vec3<f32>(0.3, 0.8, 1.0);
-  p.glow_color = vec3<f32>(0.0, 0.4, 0.6);
-  p.pulse_speed = 1.0;
-  p.float_amount = 1.0;
-  p.particle_speed = 1.0;
-  p.eye_scale = 1.0;
-  p.eye_y_offset = 0.0;
-  p.brow_angle = 0.0;
-  p.mouth_smile = 0.0;
-  p.mouth_open = 0.0;
-  p.head_tilt = 0.0;
+fn params_for_state(state: u32, k: f32) -> CloudParams {
+  var p: CloudParams;
+  p.color_core = vec3<f32>(0.2, 0.65, 0.95);
+  p.color_edge = vec3<f32>(0.05, 0.4, 0.75);
+  p.color_accent = vec3<f32>(0.4, 0.9, 1.0);
+  p.swarm_radius = 0.12;
+  p.density = 0.7;
+  p.edge_softness = 0.2;
+  p.internal_motion = 0.45;
+  p.pulse_speed = 0.8;
+  p.particle_size = 0.0030;
+  p.particle_strength = 0.7;
 
-  var t_line = p.line_color;
-  var t_node = p.node_color;
-  var t_glow = p.glow_color;
+  var t_core = p.color_core;
+  var t_edge = p.color_edge;
+  var t_accent = p.color_accent;
+  var t_radius = p.swarm_radius;
+  var t_density = p.density;
+  var t_softness = p.edge_softness;
+  var t_motion = p.internal_motion;
   var t_pulse = p.pulse_speed;
-  var t_float = p.float_amount;
-  var t_part = p.particle_speed;
-  var t_eye = p.eye_scale;
-  var t_eye_y = p.eye_y_offset;
-  var t_brow = p.brow_angle;
-  var t_smile = p.mouth_smile;
-  var t_open = p.mouth_open;
-  var t_tilt = p.head_tilt;
+  var t_size = p.particle_size;
+  var t_strength = p.particle_strength;
 
   if (state == 1u) { // curious
-    t_line = vec3<f32>(0.1, 0.7, 0.9);
-    t_node = vec3<f32>(0.2, 0.9, 1.0);
-    t_glow = vec3<f32>(0.0, 0.5, 0.7);
-    t_pulse = 1.3;
-    t_eye = 1.15;
-    t_eye_y = 0.02;
-    t_brow = 0.5;
-    t_open = 0.2;
-    t_smile = 0.1;
-    t_tilt = 0.08;
+    t_core = vec3<f32>(0.15, 0.9, 1.0);
+    t_edge = vec3<f32>(0.1, 0.6, 0.9);
+    t_accent = vec3<f32>(0.35, 1.0, 0.95);
+    t_radius = 0.16;
+    t_density = 0.6;
+    t_softness = 0.25;
+    t_motion = 0.75;
+    t_pulse = 1.2;
+    t_size = 0.0032;
+    t_strength = 0.75;
   } else if (state == 2u) { // focused
-    t_line = vec3<f32>(0.4, 0.3, 0.9);
-    t_node = vec3<f32>(0.6, 0.4, 1.0);
-    t_glow = vec3<f32>(0.3, 0.1, 0.6);
-    t_pulse = 1.8;
-    t_float = 0.6;
-    t_eye = 0.8;
-    t_brow = -0.3;
-    t_smile = -0.15;
+    t_core = vec3<f32>(0.55, 0.45, 0.95);
+    t_edge = vec3<f32>(0.2, 0.1, 0.4);
+    t_accent = vec3<f32>(0.75, 0.6, 1.0);
+    t_radius = 0.08;
+    t_density = 0.95;
+    t_softness = 0.12;
+    t_motion = 0.2;
+    t_pulse = 0.55;
+    t_size = 0.0024;
+    t_strength = 0.85;
   } else if (state == 3u) { // amused
-    t_line = vec3<f32>(0.1, 0.8, 0.6);
-    t_node = vec3<f32>(0.2, 1.0, 0.7);
-    t_glow = vec3<f32>(0.0, 0.5, 0.4);
-    t_pulse = 1.5;
-    t_part = 1.5;
-    t_eye = 0.7;
-    t_eye_y = -0.02;
-    t_brow = 0.3;
-    t_smile = 0.8;
-    t_open = 0.15;
-    t_tilt = -0.05;
+    t_core = vec3<f32>(0.1, 0.95, 0.6);
+    t_edge = vec3<f32>(0.05, 0.7, 0.75);
+    t_accent = vec3<f32>(0.35, 1.0, 0.7);
+    t_radius = 0.14;
+    t_density = 0.75;
+    t_softness = 0.23;
+    t_motion = 0.9;
+    t_pulse = 1.6;
+    t_size = 0.0034;
+    t_strength = 0.9;
   } else if (state == 4u) { // alert
-    t_line = vec3<f32>(1.0, 0.5, 0.2);
-    t_node = vec3<f32>(1.0, 0.7, 0.3);
-    t_glow = vec3<f32>(0.6, 0.2, 0.0);
-    t_pulse = 3.0;
-    t_part = 2.0;
-    t_float = 1.5;
-    t_eye = 1.4;
-    t_eye_y = 0.03;
-    t_brow = 0.8;
-    t_open = 0.5;
-    t_smile = -0.2;
+    t_core = vec3<f32>(1.0, 0.6, 0.25);
+    t_edge = vec3<f32>(0.9, 0.25, 0.12);
+    t_accent = vec3<f32>(1.0, 0.8, 0.4);
+    t_radius = 0.18;
+    t_density = 0.5;
+    t_softness = 0.3;
+    t_motion = 1.0;
+    t_pulse = 2.1;
+    t_size = 0.0036;
+    t_strength = 1.0;
   } else if (state == 5u) { // sleepy
-    t_line = vec3<f32>(0.15, 0.3, 0.5);
-    t_node = vec3<f32>(0.2, 0.4, 0.6);
-    t_glow = vec3<f32>(0.05, 0.15, 0.25);
-    t_pulse = 0.4;
-    t_part = 0.3;
-    t_float = 0.4;
-    t_eye = 0.4;
-    t_eye_y = -0.04;
-    t_brow = -0.2;
-    t_smile = -0.1;
-    t_tilt = 0.06;
+    t_core = vec3<f32>(0.15, 0.3, 0.5);
+    t_edge = vec3<f32>(0.06, 0.2, 0.35);
+    t_accent = vec3<f32>(0.2, 0.4, 0.6);
+    t_radius = 0.10;
+    t_density = 0.4;
+    t_softness = 0.18;
+    t_motion = 0.15;
+    t_pulse = 0.35;
+    t_size = 0.0022;
+    t_strength = 0.5;
   }
 
-  p.line_color = mix(p.line_color, t_line, k);
-  p.node_color = mix(p.node_color, t_node, k);
-  p.glow_color = mix(p.glow_color, t_glow, k);
+  p.color_core = mix(p.color_core, t_core, k);
+  p.color_edge = mix(p.color_edge, t_edge, k);
+  p.color_accent = mix(p.color_accent, t_accent, k);
+  p.swarm_radius = mix(p.swarm_radius, t_radius, k);
+  p.density = mix(p.density, t_density, k);
+  p.edge_softness = mix(p.edge_softness, t_softness, k);
+  p.internal_motion = mix(p.internal_motion, t_motion, k);
   p.pulse_speed = mix(p.pulse_speed, t_pulse, k);
-  p.float_amount = mix(p.float_amount, t_float, k);
-  p.particle_speed = mix(p.particle_speed, t_part, k);
-  p.eye_scale = mix(p.eye_scale, t_eye, k);
-  p.eye_y_offset = mix(p.eye_y_offset, t_eye_y, k);
-  p.brow_angle = mix(p.brow_angle, t_brow, k);
-  p.mouth_smile = mix(p.mouth_smile, t_smile, k);
-  p.mouth_open = mix(p.mouth_open, t_open, k);
-  p.head_tilt = mix(p.head_tilt, t_tilt, k);
+  p.particle_size = mix(p.particle_size, t_size, k);
+  p.particle_strength = mix(p.particle_strength, t_strength, k);
 
   return p;
 }
 
-// ============================================================================
-// FACE GEOMETRY
-// ============================================================================
-
-fn face_mesh(uv: vec2<f32>, fp: FaceParams, time: f32) -> f32 {
-  let tilt = fp.head_tilt + 0.02 * sin(time * 0.5);
-  let c = cos(tilt);
-  let s = sin(tilt);
-  var p = vec2<f32>(c * uv.x - s * uv.y, s * uv.x + c * uv.y);
-  p.y = p.y - 0.01 * sin(time * fp.pulse_speed) * fp.float_amount;
-
-  let line_w = 0.003;
-  var d = 1000.0;
-
-  // HEAD OUTLINE (manually specified segments)
-  d = min(d, sd_segment(p, vec2<f32>(0.0, 0.35), vec2<f32>(0.15, 0.32)));
-  d = min(d, sd_segment(p, vec2<f32>(0.15, 0.32), vec2<f32>(0.25, 0.22)));
-  d = min(d, sd_segment(p, vec2<f32>(0.25, 0.22), vec2<f32>(0.28, 0.05)));
-  d = min(d, sd_segment(p, vec2<f32>(0.28, 0.05), vec2<f32>(0.25, -0.12)));
-  d = min(d, sd_segment(p, vec2<f32>(0.25, -0.12), vec2<f32>(0.18, -0.25)));
-  d = min(d, sd_segment(p, vec2<f32>(0.18, -0.25), vec2<f32>(0.08, -0.32)));
-  d = min(d, sd_segment(p, vec2<f32>(0.08, -0.32), vec2<f32>(0.0, -0.35)));
-  d = min(d, sd_segment(p, vec2<f32>(0.0, -0.35), vec2<f32>(-0.08, -0.32)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.08, -0.32), vec2<f32>(-0.18, -0.25)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.18, -0.25), vec2<f32>(-0.25, -0.12)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.25, -0.12), vec2<f32>(-0.28, 0.05)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.28, 0.05), vec2<f32>(-0.25, 0.22)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.25, 0.22), vec2<f32>(-0.15, 0.32)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.15, 0.32), vec2<f32>(0.0, 0.35)));
-
-  // INTERNAL STRUCTURE
-  d = min(d, sd_segment(p, vec2<f32>(-0.2, 0.2), vec2<f32>(0.2, 0.2)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.15, 0.28), vec2<f32>(0.15, 0.28)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.22, 0.0), vec2<f32>(-0.1, -0.05)));
-  d = min(d, sd_segment(p, vec2<f32>(0.22, 0.0), vec2<f32>(0.1, -0.05)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.2, -0.15), vec2<f32>(0.2, -0.15)));
-  d = min(d, sd_segment(p, vec2<f32>(0.0, 0.12), vec2<f32>(0.0, -0.08)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.04, -0.08), vec2<f32>(0.04, -0.08)));
-
-  // EYES
-  let eye_y = 0.08 + fp.eye_y_offset;
-  let eye_h = 0.035 * fp.eye_scale;
-  let eye_w = 0.06;
-
-  // Left eye (diamond shape)
-  d = min(d, sd_segment(p, vec2<f32>(-0.1 - eye_w, eye_y), vec2<f32>(-0.1, eye_y + eye_h)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.1, eye_y + eye_h), vec2<f32>(-0.1 + eye_w, eye_y)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.1 + eye_w, eye_y), vec2<f32>(-0.1, eye_y - eye_h)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.1, eye_y - eye_h), vec2<f32>(-0.1 - eye_w, eye_y)));
-
-  // Right eye (diamond shape)
-  d = min(d, sd_segment(p, vec2<f32>(0.1 - eye_w, eye_y), vec2<f32>(0.1, eye_y + eye_h)));
-  d = min(d, sd_segment(p, vec2<f32>(0.1, eye_y + eye_h), vec2<f32>(0.1 + eye_w, eye_y)));
-  d = min(d, sd_segment(p, vec2<f32>(0.1 + eye_w, eye_y), vec2<f32>(0.1, eye_y - eye_h)));
-  d = min(d, sd_segment(p, vec2<f32>(0.1, eye_y - eye_h), vec2<f32>(0.1 - eye_w, eye_y)));
-
-  // Eye connections to head
-  d = min(d, sd_segment(p, vec2<f32>(-0.1 - eye_w, eye_y), vec2<f32>(-0.22, 0.0)));
-  d = min(d, sd_segment(p, vec2<f32>(0.1 + eye_w, eye_y), vec2<f32>(0.22, 0.0)));
-  d = min(d, sd_segment(p, vec2<f32>(-0.1, eye_y + eye_h), vec2<f32>(-0.1, 0.2)));
-  d = min(d, sd_segment(p, vec2<f32>(0.1, eye_y + eye_h), vec2<f32>(0.1, 0.2)));
-
-  // EYEBROWS
-  let brow_y = 0.16 + fp.eye_y_offset;
-  let brow_in_y = brow_y - fp.brow_angle * 0.03;
-  let brow_out_y = brow_y + fp.brow_angle * 0.02;
-  d = min(d, sd_segment(p, vec2<f32>(-0.14, brow_out_y), vec2<f32>(-0.05, brow_in_y)));
-  d = min(d, sd_segment(p, vec2<f32>(0.05, brow_in_y), vec2<f32>(0.14, brow_out_y)));
-
-  // MOUTH
-  let mouth_y = -0.2;
-  let mouth_w = 0.08 + fp.mouth_open * 0.02;
-  let smile = fp.mouth_smile * 0.04;
-  let open_amt = fp.mouth_open * 0.03;
-
-  // Upper lip
-  d = min(d, sd_segment(p, vec2<f32>(-mouth_w, mouth_y + smile * 0.5), vec2<f32>(0.0, mouth_y - 0.01)));
-  d = min(d, sd_segment(p, vec2<f32>(0.0, mouth_y - 0.01), vec2<f32>(mouth_w, mouth_y + smile * 0.5)));
-
-  // Lower lip
-  let low_y = mouth_y - open_amt;
-  d = min(d, sd_segment(p, vec2<f32>(-mouth_w, mouth_y + smile * 0.5), vec2<f32>(-mouth_w * 0.5, low_y - smile)));
-  d = min(d, sd_segment(p, vec2<f32>(-mouth_w * 0.5, low_y - smile), vec2<f32>(0.0, low_y - smile * 0.5)));
-  d = min(d, sd_segment(p, vec2<f32>(0.0, low_y - smile * 0.5), vec2<f32>(mouth_w * 0.5, low_y - smile)));
-  d = min(d, sd_segment(p, vec2<f32>(mouth_w * 0.5, low_y - smile), vec2<f32>(mouth_w, mouth_y + smile * 0.5)));
-
-  // Chin line
-  d = min(d, sd_segment(p, vec2<f32>(0.0, low_y - smile * 0.5 - 0.02), vec2<f32>(0.0, -0.32)));
-
-  return d - line_w;
-}
-
-fn face_nodes(uv: vec2<f32>, fp: FaceParams, time: f32) -> f32 {
-  let tilt = fp.head_tilt + 0.02 * sin(time * 0.5);
-  let c = cos(tilt);
-  let s = sin(tilt);
-  var p = vec2<f32>(c * uv.x - s * uv.y, s * uv.x + c * uv.y);
-  p.y = p.y - 0.01 * sin(time * fp.pulse_speed) * fp.float_amount;
-
-  var glow = 0.0;
-  let pulse = 0.5 + 0.5 * sin(time * fp.pulse_speed * 2.0);
-
-  // Head outline nodes
-  glow = max(glow, exp(-length(p - vec2<f32>(0.0, 0.35)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.15, 0.32)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.25, 0.22)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.28, 0.05)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.25, -0.12)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.18, -0.25)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.0, -0.35)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.18, -0.25)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.25, -0.12)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.28, 0.05)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.25, 0.22)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.15, 0.32)) * 80.0));
-
-  // Eye nodes
-  let eye_y = 0.08 + fp.eye_y_offset;
-  let eye_h = 0.035 * fp.eye_scale;
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.16, eye_y)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.1, eye_y + eye_h)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.04, eye_y)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.1, eye_y - eye_h)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.04, eye_y)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.1, eye_y + eye_h)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.16, eye_y)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.1, eye_y - eye_h)) * 80.0));
-
-  // Brow nodes
-  let brow_y = 0.16 + fp.eye_y_offset;
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.14, brow_y + fp.brow_angle * 0.02)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.05, brow_y - fp.brow_angle * 0.03)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.05, brow_y - fp.brow_angle * 0.03)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.14, brow_y + fp.brow_angle * 0.02)) * 80.0));
-
-  // Mouth nodes
-  let smile = fp.mouth_smile * 0.02;
-  glow = max(glow, exp(-length(p - vec2<f32>(-0.08, -0.2 + smile)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.08, -0.2 + smile)) * 80.0));
-  glow = max(glow, exp(-length(p - vec2<f32>(0.0, -0.21)) * 80.0));
-
-  return glow * (0.7 + 0.3 * pulse);
-}
-
-fn particles(uv: vec2<f32>, fp: FaceParams, time: f32) -> f32 {
-  var glow = 0.0;
-
-  // Manually define 20 particles with different positions
-  for (var i = 0u; i < 20u; i = i + 1u) {
-    let fi = f32(i);
-    let rnd_x = fract(sin(fi * 12.9898) * 43758.5453);
-    let rnd_y = fract(sin(fi * 78.233) * 43758.5453);
-
-    let angle = rnd_x * 6.28 + time * fp.particle_speed * (0.3 + rnd_y * 0.4);
-    let radius = 0.35 + rnd_y * 0.25;
-    let height = (rnd_x - 0.5) * 0.6;
-
-    var pos = vec2<f32>(
-      cos(angle) * radius,
-      height + sin(angle * 2.0 + time * fp.particle_speed) * 0.05
-    );
-
-    let drift = sin(time * 0.5 + fi) * 0.1 * fp.float_amount;
-    pos = pos * (1.0 + drift * 0.3);
-
-    let dist = length(uv - pos);
-    let size = 0.003 + rnd_y * 0.004;
-    let brightness = 0.3 + 0.4 * sin(time * 2.0 + fi * 0.5);
-
-    glow = glow + exp(-dist / size) * brightness * 0.12;
-  }
-
-  return glow;
-}
-
-fn particle_connections(uv: vec2<f32>, fp: FaceParams, time: f32) -> f32 {
-  var line_glow = 0.0;
-
-  for (var i = 0u; i < 10u; i = i + 1u) {
-    let fi = f32(i);
-    let rnd_x = fract(sin(fi * 23.456) * 43758.5453);
-    let rnd_y = fract(sin(fi * 67.89) * 43758.5453);
-
-    let angle = rnd_x * 6.28 + time * fp.particle_speed * 0.2;
-    let radius = 0.4 + rnd_y * 0.2;
-
-    let outer = vec2<f32>(cos(angle) * radius, (rnd_x - 0.5) * 0.5);
-    let inner_angle = angle + 0.2;
-    let inner = vec2<f32>(cos(inner_angle) * 0.28, sin(inner_angle) * 0.2);
-
-    let vis = step(0.6, sin(time * 1.5 + fi * 0.7));
-
-    let dist = sd_segment(uv, inner, outer);
-    line_glow = line_glow + exp(-dist * 200.0) * 0.08 * vis;
-  }
-
-  return line_glow;
+fn soft_particle(dist: f32, radius: f32) -> f32 {
+  let r = max(radius, 0.0006);
+  return 1.0 - smoothstep(r, r * 1.8, dist);
 }
 
 // ============================================================================
 // MAIN RENDER
 // ============================================================================
 
-fn render(px: vec2<f32>, res: vec2<f32>, time: f32, fp: FaceParams) -> vec3<f32> {
+fn render_cloud(px: vec2<f32>, res: vec2<f32>, time: f32, params: CloudParams) -> vec3<f32> {
+  let aspect = res.x / res.y;
+  let center_offset = (u.position - vec2<f32>(0.5, 0.5)) * vec2<f32>(aspect, 1.0);
   var uv = (px - res * 0.5) / res.y;
+  uv = (uv - center_offset) / max(u.scale, 0.001);
 
-  // Dark background
-  var col = vec3<f32>(0.01, 0.02, 0.04);
-  col = col + vec3<f32>(0.01, 0.02, 0.03) * (1.0 - length(uv) * 0.8);
+  var col = vec3<f32>(0.008, 0.012, 0.018);
+  let vignette = 1.0 - smoothstep(0.6, 1.4, length(uv));
+  col = col + params.color_edge * 0.02 * vignette;
 
-  // Background glow
-  let bg_glow = exp(-length(uv) * 2.5) * 0.15;
-  col = col + fp.glow_color * bg_glow;
+  let pulse = 1.0 + 0.05 * sin(time * params.pulse_speed);
+  let drift_noise = vec2<f32>(
+    value_noise(vec2<f32>(time * 0.12, time * 0.15)),
+    value_noise(vec2<f32>(time * 0.17, time * 0.11))
+  ) - vec2<f32>(0.5, 0.5);
+  let drift = vec2<f32>(sin(time * 0.18), cos(time * 0.22)) * params.internal_motion * 0.05
+    + drift_noise * params.internal_motion * 0.06;
+  let local = uv - drift;
 
-  // Face wireframe
-  let face_d = face_mesh(uv, fp, time);
-  let face_line = exp(-max(0.0, face_d) * 150.0);
+  let radius = params.swarm_radius * pulse;
+  let warp = (value_noise(local * 8.0 + vec2<f32>(time * 0.2, time * 0.17)) - 0.5)
+    * params.internal_motion * 0.08;
+  let dist = length(local) + warp;
 
-  // Nodes
-  let nodes = face_nodes(uv, fp, time);
+  let softness = max(radius * params.edge_softness, 0.002);
+  let body = 1.0 - smoothstep(radius - softness, radius + softness, dist);
+  let core = 1.0 - smoothstep(0.0, radius * 0.75, dist);
+  var edge_band = smoothstep(radius - softness * 0.6, radius, dist)
+    - smoothstep(radius, radius + softness * 0.6, dist);
+  edge_band = max(edge_band, 0.0);
 
-  // Particles
-  let parts = particles(uv, fp, time);
+  let surface = ((value_noise(local * 14.0 + vec2<f32>(time * 0.35, time * 0.27)) - 0.5) * 0.6 + 0.4)
+    * body;
 
-  // Connections
-  let connections = particle_connections(uv, fp, time);
+  var particles = 0.0;
+  for (var i = 0u; i < PARTICLE_COUNT; i = i + 1u) {
+    let fi = f32(i);
+    let h1 = hash21(vec2<f32>(fi, fi * 1.73));
+    let h2 = hash21(vec2<f32>(fi * 3.11, fi * 0.91));
+    let speed = mix(0.4, 1.1, h1);
+    let angle = h2 * TAU + time * (0.35 + params.internal_motion * 0.65) * speed + h1 * 1.3;
+    let radial = radius * mix(0.35, 0.95, sqrt(h2));
 
-  // Combine
-  col = col + fp.line_color * face_line * 0.8;
-  col = col + fp.node_color * nodes;
-  col = col + fp.node_color * parts;
-  col = col + fp.line_color * connections * 0.5;
+    let jitter_phase = time * (0.6 + h1) + h2 * TAU;
+    let jitter = vec2<f32>(sin(jitter_phase), cos(jitter_phase)) * params.internal_motion * 0.02;
 
-  // Inner glow
-  let face_fill = smoothstep(0.3, 0.0, length(uv)) * 0.05;
-  col = col + fp.glow_color * face_fill;
+    let pos = vec2<f32>(cos(angle), sin(angle)) * radial + jitter;
+    let dist_p = length(local - pos);
+    let size = params.particle_size * mix(0.7, 1.3, h1);
+    particles = particles + soft_particle(dist_p, size);
+  }
 
-  // Scanlines
-  let scan = 0.98 + 0.02 * sin(px.y * 2.0);
-  col = col * scan;
+  particles = particles * body;
+  col = col + params.color_core * core * (0.45 + params.density * 0.55);
+  col = col + params.color_edge * edge_band * (0.35 + params.density * 0.25);
+  col = col + params.color_edge * surface * 0.18;
+  col = col + params.color_accent * particles * params.particle_strength * 0.45;
 
-  // Vignette
-  let vign = 1.0 - length(uv) * 0.5;
-  col = col * vign;
+  let grain = hash21(px + vec2<f32>(time, time)) * 0.015;
+  col = col + vec3<f32>(grain);
+
+  let intensity = mix(0.55, 1.0, u.intensity);
+  col = col * intensity;
 
   return clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
 }
@@ -418,17 +240,17 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
   let time = u.time;
   let blend = saturate(u.blend_factor);
 
-  let fp_cur = params_for_state(u.current_state, u.intensity);
-  let fp_tgt = params_for_state(u.target_state, u.intensity);
+  let cp_cur = params_for_state(u.current_state, u.intensity);
+  let cp_tgt = params_for_state(u.target_state, u.intensity);
 
   if (blend <= 0.001 || u.current_state == u.target_state) {
-    return vec4<f32>(render(frag_coord.xy, u.resolution, time, fp_cur), 1.0);
+    return vec4<f32>(render_cloud(frag_coord.xy, u.resolution, time, cp_cur), 1.0);
   }
   if (blend >= 0.999) {
-    return vec4<f32>(render(frag_coord.xy, u.resolution, time, fp_tgt), 1.0);
+    return vec4<f32>(render_cloud(frag_coord.xy, u.resolution, time, cp_tgt), 1.0);
   }
 
-  let col_a = render(frag_coord.xy, u.resolution, time, fp_cur);
-  let col_b = render(frag_coord.xy, u.resolution, time, fp_tgt);
+  let col_a = render_cloud(frag_coord.xy, u.resolution, time, cp_cur);
+  let col_b = render_cloud(frag_coord.xy, u.resolution, time, cp_tgt);
   return vec4<f32>(mix(col_a, col_b, blend), 1.0);
 }
