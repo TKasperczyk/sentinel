@@ -252,6 +252,96 @@ impl MotionParams {
 }
 
 #[derive(Debug, Copy, Clone)]
+struct SynapticParams {
+    damping: f32,
+    noise_strength: f32,
+    attraction: f32,
+    speed: f32,
+    trail_fade: f32,
+    glow_intensity: f32,
+    color_shift: f32,
+}
+
+impl SynapticParams {
+    fn for_state(state: u32, intensity: f32) -> Self {
+        let intensity = intensity.clamp(0.0, 1.0);
+        let mut params = match state {
+            1 => Self {
+                damping: 0.996,
+                noise_strength: 8.0,
+                attraction: 0.3,
+                speed: 1.3,
+                trail_fade: 0.993,
+                glow_intensity: 1.0,
+                color_shift: 0.12,
+            },
+            2 => Self {
+                damping: 0.999,
+                noise_strength: 3.0,
+                attraction: 0.9,
+                speed: 0.7,
+                trail_fade: 0.998,
+                glow_intensity: 0.75,
+                color_shift: -0.05,
+            },
+            3 => Self {
+                damping: 0.994,
+                noise_strength: 12.0,
+                attraction: 0.4,
+                speed: 1.6,
+                trail_fade: 0.99,
+                glow_intensity: 1.15,
+                color_shift: 0.2,
+            },
+            4 => Self {
+                damping: 0.992,
+                noise_strength: 15.0,
+                attraction: 0.6,
+                speed: 2.0,
+                trail_fade: 0.985,
+                glow_intensity: 1.3,
+                color_shift: 0.28,
+            },
+            5 => Self {
+                damping: 0.9995,
+                noise_strength: 2.0,
+                attraction: 0.7,
+                speed: 0.4,
+                trail_fade: 0.999,
+                glow_intensity: 0.6,
+                color_shift: -0.12,
+            },
+            _ => Self {
+                damping: 0.998,
+                noise_strength: 5.0,
+                attraction: 0.5,
+                speed: 1.0,
+                trail_fade: 0.995,
+                glow_intensity: 0.85,
+                color_shift: 0.0,
+            },
+        };
+
+        params.glow_intensity *= 0.45 + 0.55 * intensity;
+        params.color_shift *= 0.35 + 0.65 * intensity;
+
+        params
+    }
+
+    fn lerp(self, other: Self, t: f32) -> Self {
+        Self {
+            damping: lerp(self.damping, other.damping, t),
+            noise_strength: lerp(self.noise_strength, other.noise_strength, t),
+            attraction: lerp(self.attraction, other.attraction, t),
+            speed: lerp(self.speed, other.speed, t),
+            trail_fade: lerp(self.trail_fade, other.trail_fade, t),
+            glow_intensity: lerp(self.glow_intensity, other.glow_intensity, t),
+            color_shift: lerp(self.color_shift, other.color_shift, t),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
 struct MotionState {
     pos_x: SmoothValue,
     pos_y: SmoothValue,
@@ -490,6 +580,7 @@ fn main() {
         intensity: SmoothValue::new(intensity, start_time),
         motion: MotionState::new(start_time),
         cycle_states,
+        frame_count: 0,
         ipc_token: None,
         ipc_buffer: Vec::new(),
         ipc_path: None,
@@ -565,6 +656,7 @@ struct AppState {
     intensity: SmoothValue,
     motion: MotionState,
     cycle_states: bool,
+    frame_count: u32,
     ipc_token: Option<RegistrationToken>,
     ipc_buffer: Vec<u8>,
     ipc_path: Option<PathBuf>,
@@ -592,11 +684,18 @@ impl AppState {
         self.intensity.update(now, self.transition_duration);
 
         let blend = self.entity_state.blend_factor();
-        let params_cur = MotionParams::for_state(self.entity_state.current_state, self.intensity.current);
-        let params_tgt = MotionParams::for_state(self.entity_state.target_state, self.intensity.current);
+        let params_cur =
+            MotionParams::for_state(self.entity_state.current_state, self.intensity.current);
+        let params_tgt =
+            MotionParams::for_state(self.entity_state.target_state, self.intensity.current);
         let motion_params = params_cur.lerp(params_tgt, blend);
         let (position, scale) = self.motion.update(now, motion_params, t);
 
+        let syn_cur = SynapticParams::for_state(self.entity_state.current_state, self.intensity.current);
+        let syn_tgt = SynapticParams::for_state(self.entity_state.target_state, self.intensity.current);
+        let syn_params = syn_cur.lerp(syn_tgt, blend);
+
+        let frame_count = self.frame_count;
         let uniforms = Uniforms::new(
             t,
             self.entity_state.current_state,
@@ -607,12 +706,22 @@ impl AppState {
             position,
             self.width,
             self.height,
+            frame_count,
+            syn_params.damping,
+            syn_params.noise_strength,
+            syn_params.attraction,
+            syn_params.speed,
+            syn_params.trail_fade,
+            syn_params.glow_intensity,
+            syn_params.color_shift,
         );
         if let Err(e) = gpu.render(&uniforms) {
             error!("wgpu render error: {e:?}");
             if let Some(signal) = &self.loop_signal {
                 signal.stop();
             }
+        } else {
+            self.frame_count = self.frame_count.wrapping_add(1);
         }
     }
 }
